@@ -1,4 +1,5 @@
 from geopy.distance import geodesic
+from collections import deque
 
 
 class HOSCalculator:
@@ -84,15 +85,17 @@ class HOSCalculator:
         pickup_done = False
         current_location = [0, 0]  # Default starting location
         
+        # Track daily duty hours for the 8-day cycle
+        # Initialize with the initial hours used for the first day
+        daily_duty_hours = deque([initial_hours_used] + [0.0] * (self.cycle_days - 1), maxlen=self.cycle_days)
+        
         for i, segment in enumerate(route_segments):
             segment_driving_hours = segment['duration_hours']
             segment_miles = segment['distance_miles']
             
-            # Avoid division by zero
             speed_mph = segment_miles / segment_driving_hours if segment_driving_hours > 0 else 55.0  # Default speed
             remaining_segment_hours = segment_driving_hours
             
-            # Safely extract coordinates
             coords = []
             try:
                 coords = segment.get("geometry", {}).get("coordinates", [])
@@ -121,6 +124,7 @@ class HOSCalculator:
                 current_day_duty += self.pickup_duration_hours
                 hours_since_break += self.pickup_duration_hours
                 cycle_hours_used += self.pickup_duration_hours
+                daily_duty_hours[0] += self.pickup_duration_hours  # Update today's hours
                 pickup_done = True
                        
             while remaining_segment_hours > 0:
@@ -138,31 +142,66 @@ class HOSCalculator:
                     
                     current_day_duty += self.required_break_duration_hours
                     cycle_hours_used += self.required_break_duration_hours
+                    daily_duty_hours[0] += self.required_break_duration_hours  # Update today's hours
                     hours_since_break = 0
                 
-                # Check available driving time for this segment
+                # Calculate total hours for the current 8-day cycle
+                total_cycle_hours = sum(daily_duty_hours)
+                
+                # Check available driving time for this segment, including 70-hour/8-day rule
+                remaining_cycle_hours = max(0, self.max_cycle_hours - total_cycle_hours)
+                
                 available_day_driving = min(
-                    self.max_daily_driving_hours - current_day_driving,
-                    self.max_daily_duty_hours - current_day_duty,
-                    remaining_segment_hours
+                    self.max_daily_driving_hours - current_day_driving,  # Daily driving limit
+                    self.max_daily_duty_hours - current_day_duty,        # Daily duty limit
+                    remaining_cycle_hours,                              # 70-hour/8-day limit
+                    remaining_segment_hours                              # Remaining segment to drive
                 )
                 
-                # If we can't drive anymore today, take a 10-hour rest
+                # If we can't drive anymore today or hit cycle limit, take a rest
                 if available_day_driving <= 0:
-                    schedule.append({
-                        'activity_type': 'REST',
-                        'location_index': i,
-                        'duration_hours': self.min_rest_period_hours,
-                        'day': current_day,
-                        'start_duty_hours': current_day_duty,
-                        'end_duty_hours': 0,  # Reset for next day
-                        'coord': current_location  # Add coordinates to rest activity
-                    })
+                    # Check if it's due to the 70-hour rule
+                    if remaining_cycle_hours <= 0:
+                        # Need a 34-hour restart
+                        schedule.append({
+                            'activity_type': 'RESTART',
+                            'location_index': i,
+                            'duration_hours': 34.0,
+                            'day': current_day,
+                            'start_duty_hours': current_day_duty,
+                            'end_duty_hours': 0,  # Reset for next day
+                            'coord': current_location,
+                            'restart_type': '34-hour'
+                        })
+                        
+                        current_day += 2  # 34-hour rest spans at least 2 days
+                        current_day_driving = 0
+                        current_day_duty = 0
+                        hours_since_break = 0
+                        
+                        # Reset the cycle hours tracking
+                        daily_duty_hours = deque([0.0] * self.cycle_days, maxlen=self.cycle_days)
+                        cycle_hours_used = 0
+                    else:
+                        # Regular 10-hour rest period
+                        schedule.append({
+                            'activity_type': 'REST',
+                            'location_index': i,
+                            'duration_hours': self.min_rest_period_hours,
+                            'day': current_day,
+                            'start_duty_hours': current_day_duty,
+                            'end_duty_hours': 0,  # Reset for next day
+                            'coord': current_location  # Add coordinates to rest activity
+                        })
+                        
+                        current_day += 1
+                        current_day_driving = 0
+                        current_day_duty = 0
+                        hours_since_break = 0
+                        
+                        # Shift the daily duty hours tracking for the next day
+                        daily_duty_hours.append(0.0)  # This will push out the oldest day
                     
-                    current_day += 1
-                    current_day_driving = 0
-                    current_day_duty = 0
-                    hours_since_break = 0
                     continue
                 
                 # Calculate distance covered in this driving session
@@ -191,13 +230,15 @@ class HOSCalculator:
                     'day': current_day,
                     'start_duty_hours': current_day_duty,
                     'end_duty_hours': current_day_duty + available_day_driving,
-                    'coord': current_location  # Add coordinates to driving activity
+                    'coord': current_location,  # Add coordinates to driving activity
+                    'cycle_hours_remaining': self.max_cycle_hours - (total_cycle_hours + available_day_driving)
                 })
                 
                 current_day_driving += available_day_driving
                 current_day_duty += available_day_driving
                 hours_since_break += available_day_driving
                 cycle_hours_used += available_day_driving
+                daily_duty_hours[0] += available_day_driving  # Update today's hours
                 remaining_segment_hours -= available_day_driving
                 
                 # Update distance since last fuel stop
@@ -234,6 +275,7 @@ class HOSCalculator:
                         current_day_duty += self.fuel_duration_hours
                         hours_since_break += self.fuel_duration_hours
                         cycle_hours_used += self.fuel_duration_hours
+                        daily_duty_hours[0] += self.fuel_duration_hours  # Update today's hours
                         distance_since_fuel = 0  # Reset the distance counter
                     except Exception as e:
                         # If there's any error, use a simpler approach
@@ -250,6 +292,7 @@ class HOSCalculator:
                         current_day_duty += self.fuel_duration_hours
                         hours_since_break += self.fuel_duration_hours
                         cycle_hours_used += self.fuel_duration_hours
+                        daily_duty_hours[0] += self.fuel_duration_hours  # Update today's hours
                         distance_since_fuel = 0  # Reset the distance counter
         
         # Add dropoff at the final location
@@ -310,13 +353,13 @@ class HOSCalculator:
                     status = 'ON'  # On-duty, not driving
                 elif activity_type == 'BREAK':
                     status = 'OFF'  # Off-duty
-                elif activity_type == 'REST':
+                elif activity_type in ['REST', 'RESTART']:
                     status = 'SB'  # Sleeper berth
                 else:
                     status = 'OFF'
                 
                 start_hour = item['start_duty_hours']
-                if activity_type == 'REST':
+                if activity_type in ['REST', 'RESTART']:
                     # Rest spans to the next day
                     end_hour = 24
                 else:
@@ -333,6 +376,10 @@ class HOSCalculator:
                 # Add coordinates to the log entry if available
                 if 'coord' in item:
                     log_entry['coord'] = item['coord']
+                
+                # Add cycle hours remaining if available
+                if 'cycle_hours_remaining' in item:
+                    log_entry['cycle_hours_remaining'] = item['cycle_hours_remaining']
                 
                 daily_log['activities'].append(log_entry)
             
