@@ -5,3 +5,4 @@ Flask==3.1.0
 geopy==2.4.1
 gunicorn
 SQLAlchemy==2.0.39
+requests
